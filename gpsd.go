@@ -2,10 +2,14 @@ package gpsd
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"sync"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 // DefaultAddress of gpsd (localhost:2947)
@@ -14,11 +18,17 @@ const DefaultAddress = "localhost:2947"
 // Filter is a gpsd entry filter function
 type Filter func(interface{})
 
+// ErrorHandler is a function called in case of error
+type ErrorHandler func(error)
+
 // Session represents a connection to gpsd
 type Session struct {
-	socket  net.Conn
-	reader  *bufio.Reader
-	filters map[string][]Filter
+	conn          net.Conn
+	errors        chan error
+	errorHandlers []ErrorHandler
+	errorsLock    *sync.Mutex
+	reader        *bufio.Reader
+	filters       map[string][]Filter
 }
 
 // Mode describes status of a TPV report
@@ -182,49 +192,64 @@ type Satellite struct {
 // Dial opens a new connection to GPSD.
 func Dial(address string) (session *Session, err error) {
 	session = new(Session)
-	session.socket, err = net.Dial("tcp4", address)
+	session.conn, err = net.Dial("tcp4", address)
 	if err != nil {
 		return nil, err
 	}
 
-	session.reader = bufio.NewReader(session.socket)
+	session.reader = bufio.NewReader(session.conn)
 	session.reader.ReadString('\n')
 	session.filters = make(map[string][]Filter)
 
+	session.errorHandlers = make([]ErrorHandler, 0)
+	session.errorsLock = new(sync.Mutex)
+
 	return
+}
+
+func (s *Session) errorHandling() {
+	for {
+		select {
+		case err := <-s.errors:
+			s.errorsLock.Lock()
+			for _, handler := range s.errorHandlers {
+				handler(err)
+			}
+			s.errorsLock.Unlock()
+		}
+	}
 }
 
 // Watch starts watching GPSD reports in a new goroutine.
 //
 // Example
-//    gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
-//    done := gpsd.Watch()
-//    <- done
-func (s *Session) Watch() (done chan bool) {
-	fmt.Fprintf(s.socket, "?WATCH={\"enable\":true,\"json\":true}")
-	done = make(chan bool)
-
-	go watch(done, s)
-
-	return
+//    gps := gpsd.Init(gpsd.DEFAULT_ADDRESS)
+//    ctx, cancel := context.WithCancel(context.Background())
+//    gps.Watch(ctx)
+//    cancel()
+func (s *Session) Watch(ctx context.Context) {
+	s.errors = make(chan error)
+	fmt.Fprintf(s.conn, "?WATCH={\"enable\":true,\"json\":true}")
+	go s.errorHandling()
+	go watch(ctx, s)
 }
 
 // SendCommand sends a command to GPSD
 func (s *Session) SendCommand(command string) {
-	fmt.Fprintf(s.socket, "?"+command+";")
+	fmt.Fprintf(s.conn, "?"+command+";")
 }
 
 // AddFilter attaches a function which will be called for all
 // GPSD reports with the given class. Callback functions have type Filter.
 //
 // Example:
-//    gps := gpsd.Init(gpsd.DEFAULT_ADDRESS)
+//    gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
+//    ctx, cancel := context.WithCancel(context.Background())
 //    gps.AddFilter("TPV", func (r interface{}) {
 //      report := r.(*gpsd.TPVReport)
 //      fmt.Println(report.Time, report.Lat, report.Lon)
 //    })
-//    done := gps.Watch()
-//    <- done
+//    gps.Watch(ctx)
 func (s *Session) AddFilter(class string, f Filter) {
 	s.filters[class] = append(s.filters[class], f)
 }
@@ -235,28 +260,58 @@ func (s *Session) deliverReport(class string, report interface{}) {
 	}
 }
 
-func watch(done chan bool, s *Session) {
-	// We're not using a JSON decoder because we first need to inspect
-	// the JSON string to determine it's "class"
-	for {
-		if line, err := s.reader.ReadString('\n'); err == nil {
-			var reportPeek gpsdReport
-			lineBytes := []byte(line)
-			if err = json.Unmarshal(lineBytes, &reportPeek); err == nil {
-				if len(s.filters[reportPeek.Class]) == 0 {
-					continue
-				}
+// OnError attaches a function that is called in case of error.
+//
+// Example:
+//    gps := gpsd.Dial(gpsd.DefaultAddress)
+//    gps.OnError(func(err error) {
+//      fmt.Println("Error:", err)
+//    }
+func (s *Session) OnError(h ErrorHandler) {
+	s.errorsLock.Lock()
+	s.errorHandlers = append(s.errorHandlers, h)
+	s.errorsLock.Unlock()
+}
 
-				if report, err2 := unmarshalReport(reportPeek.Class, lineBytes); err2 == nil {
-					s.deliverReport(reportPeek.Class, report)
+// Close closes the connection to gpsd.
+//
+// Example:
+//    gps := gpsd.Dial(gpsd.DefaultAddress)
+//    if err := gps.Close(); err != nil {
+//	    fmt.Println("Error:", err)
+//}
+func (s *Session) Close() error {
+	return s.conn.Close()
+}
+
+func watch(ctx context.Context, s *Session) {
+	// We're not using a JSON decoder because we first need to inspect
+	// the JSON string to determine its class
+	for {
+		select {
+		case <-ctx.Done():
+			close(s.errors)
+			return
+		default:
+			if line, err := s.reader.ReadString('\n'); err == nil {
+				var reportPeek gpsdReport
+				lineBytes := []byte(line)
+				if err = json.Unmarshal(lineBytes, &reportPeek); err == nil {
+					if len(s.filters[reportPeek.Class]) == 0 {
+						continue
+					}
+
+					if report, err2 := unmarshalReport(reportPeek.Class, lineBytes); err2 == nil {
+						s.deliverReport(reportPeek.Class, report)
+					} else {
+						s.errors <- errors.Wrap(err2, "JSON parsing error 2:")
+					}
 				} else {
-					fmt.Println("JSON parsing error 2:", err)
+					s.errors <- errors.Wrap(err, "JSON parsing error:")
 				}
 			} else {
-				fmt.Println("JSON parsing error:", err)
+				s.errors <- errors.Wrap(err, "Stream reader error - is gpsd running?")
 			}
-		} else {
-			fmt.Println("Stream reader error (is gpsd running?):", err)
 		}
 	}
 }
