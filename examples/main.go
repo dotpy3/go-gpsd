@@ -1,6 +1,12 @@
 package main
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"time"
+
+	gpsd "github.com/dotpy3/go-gpsd"
+)
 
 func main() {
 	var gps *gpsd.Session
@@ -23,6 +29,13 @@ func main() {
 
 	gps.AddFilter("SKY", skyfilter)
 
-	done := gps.Watch()
-	<-done
+	gps.OnError(func(err error) {
+		fmt.Println("gpsd error:", err)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	gps.Watch(ctx)
+	<-time.After(10 * time.Minute)
+	fmt.Println("Shutting gpsd down...")
+	cancel()
 }
