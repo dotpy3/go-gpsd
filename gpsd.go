@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -310,6 +311,10 @@ func watch(ctx context.Context, s *Session) {
 					s.errors <- errors.Wrap(err, "JSON parsing error:")
 				}
 			} else {
+				if err == io.EOF {
+					s.errors <- errors.Wrap(err, "End of stream, closing watch cycle.")
+					return
+				}
 				s.errors <- errors.Wrap(err, "Stream reader error - is gpsd running?")
 			}
 		}
